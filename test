@@ -1,0 +1,587 @@
+
+$(Must_Include=..\..\Config\Environment_Settings.txt);
+
+SET EBSPath = \\$(vServer)\QlikView_Files\data\group_EBS;
+SET QVDPathRaw = \\$(vServer)\QlikView_Files\qvds\raw\group\EBS;
+SET RefDataPath = \\$(vServer)\QlikView_Files\data\group_EBS;
+
+//Configuration files for the environment.
+// $(Must_Include=.\Config\EBS_Connection_Settings.txt);
+// $(Must_Include=.\Config\EBS_FileLocation_Settings.txt);
+// $(Must_Include=.\Config\Colour_Settings.txt);
+// $(Must_Include=.\Config\Common_Procedures.txt);
+
+LET vReloadStart = NOW(1);
+
+// Save Start time to a table.  If load is successful this will be saved to QVD to be used as start point for next load
+
+Runtime:
+ LOAD * INLINE [
+    Runtime
+    $(vReloadStart)
+];
+
+TRACE === Reload Start at $(=TIMESTAMP(vReloadStart,'DD-MMM-YY hh:mm:ss')) ===;
+
+///$tab Connection EBS
+////////////////////////////////////////////////////////////////////////////////
+//
+// Connect to Oracle EBS and force language and date settings
+//
+////////////////////////////////////////////////////////////////////////////////
+
+//OLEDB CONNECT TO [Provider=OraOLEDB.Oracle.1;Persist Security Info=True;User ID=apps_ro;Data Source=PREBS01;Extended Properties=""] (XPassword is RLQJLRFMZLbKHXBGRZUB);
+
+$(vConEBS_122);
+$(vConEBSLang);
+$(vConEBSDate);
+SQL ALTER SESSION SET NLS_DATE_FORMAT = 'DD-MON-RR';
+
+///$tab About
+////////////////////////////////////////////////////////////////////////////////
+//
+// About this QlikView script
+//
+////////////////////////////////////////////////////////////////////////////////
+
+LET vScriptTitle = 'EBS GL RAW Data Facts Loader';
+LET vScriptDescription = 'Loading of raw GL Facts (Journals and GL Period balances) from EBS Prod Environment';  
+
+ScriptHistory:
+LOAD	
+	'$(vScriptTitle)'		as [%_Script],
+	[Date]					as [Script Date],
+	[Author]				as [Script Author],
+	[Version]				as [Script Version],
+	[Notes]					as [Script Notes]
+INLINE [
+Date, Author, Version, Notes
+17/12/2019, Niki Salter, 1, Split out GL and Journal Lines into 1 QVD per period (3TERP1)
+06/01/2020, Niki Salter, 1.1, Add in incremental for headers and batches
+02/06/2020, Jane Johnson,1.2, Add GL_CODE_COMBINATIONS_FKV (WO0000000235953)
+18/08/2020, David Foster,2, Preparation for 12.2 including environment and code combinations changes
+08/04/2021, Jane Johnson,2.1, Add %_PO_HEADER_ID to GL_JE_LINES (INC0025244)
+09/06/2021, Jane Johnson,2.2, Remove ledger filter from PO Header map (ERP-7617)
+22/11/2021, Jane Johnson,2.3, Add %_PO_DISTRIBUTION_ID to Journal Lines (SCTASK0030180)
+15/12/2021, Jane Johnson,2.4, Add %_AP_INVOICE_ID (SCTASK0030410)
+14/01/2022, Jane Johnson,2.4, Add %_EBS_Project_ID to GL_JE_LINES (DIS-172)
+27/04/2022, Jane Johnson,2.5, Add %_LEASE_ID to GL_JE_LINES (DIS-204)
+05/05/2022, Jane Johnson,2.6, Remove ledger filter from Lease lookup (INC0065771)
+01/08/2022, Jane Johnson,2.7, Add %_CUSTOMER_TRX_ID to GL_JE_LINES (DIS-444)
+];
+
+LET vScriptCurrVersion = peek('Script Version', -1,'ScriptHistory');
+LET vScriptCurrAuthor = peek('Script Author', -1,'ScriptHistory');
+
+///$tab Set up
+////////////////////////////////////////////////////////////////////////////////
+//
+// Get Run Type
+//
+////////////////////////////////////////////////////////////////////////////////
+
+RunTable:
+LOAD Runtype as RunType
+FROM
+[$(RefDataPath)\GL Periods.xlsx]
+(ooxml, embedded labels, table is RunType);
+
+//let vRuntype = alt(peek('RunType',0,'RunTable'),'Normal');
+
+let vRuntype = peek('RunType',0,'RunTable');
+
+TRACE $(vRuntype);
+
+// If normal Incremental get Last runtime
+
+If vRuntype = 'Normal' then
+
+	Loadstart:
+	
+	LOAD Runtime as Lastruntime2
+	FROM
+	[$(QVDPathRaw)\Last_GL_Runtime.qvd]
+	(qvd);
+	
+	//Set Last run time as a parameter to be used later to determine which QVDs to reload for normal load
+	
+	let vLastruntime = peek('Lastruntime2',0,'Loadstart');
+	
+	TRACE $(vLastruntime);
+
+ENDIF;
+
+///$tab GL_JOURNALS
+////////////////////////////////////////////////////////////////////////////////
+//
+// Load invidual period QVDs for the GL Journals tables - only loads data and 
+// periods which have been edited since last loader run.
+//
+////////////////////////////////////////////////////////////////////////////////
+
+//If 'normal', incremental load a table of all the distinct periods that have been edited since the loader was last run
+
+
+
+If vRuntype = 'Normal' then
+
+Let vLastUpdateDate = Date(Date#('$(vLastruntime)','DD/MM/YYYY hh:mm:ss') - 7,'DD/MM/YYYY hh:mm:ss'); //allow a 7 day overlap.
+
+dist_period:
+LOAD PERIOD_NAME as P_NAME; 
+SQL 
+	Select distinct PERIOD_NAME 
+	from GL_JE_LINES
+	where GL_JE_LINES.EFFECTIVE_DATE >= TO_DATE('2010-07-01 00:00:00', 'yyyy-MM-dd hh24:mi:ss')
+	and LAST_UPDATE_DATE >= TO_DATE('$(vLastUpdateDate)','dd/mm/yyyy hh24:mi:ss');
+
+else
+
+	dist_period:
+	LOAD JNL_Fiscal_Period as P_NAME
+	FROM
+	[$(RefDataPath)\GL Periods.xlsx]
+	(ooxml, embedded labels, table is Journals)
+	WHERE(not IsNull(JNL_Fiscal_Period));
+
+ENDIF;
+
+
+If NoOfRows('dist_period') > 0 then
+
+	// loop through the periods 
+	for i = 0 to NoOfRows('dist_period')-1
+	
+		//Set a parameter for the first period in the periods table
+		let vperiod = peek('P_NAME',$(i),'dist_period');
+		
+		TRACE $(vperiod);
+
+		// PO Distribution lookup		
+		PD_map:
+		Mapping
+		LOAD *;
+		SQL select distinct h.PERIOD_NAME || '|' || gjl.je_header_id || gjl.je_line_num as KEY
+					,pda.PO_DISTRIBUTION_ID
+		from   gl_je_headers                             h
+			,gl_je_lines                              gjl
+			,gl_import_references                     gir
+			,xla.xla_ae_headers                       xah
+			,xla.xla_ae_lines                         xal
+			,xla.xla_events                           xle
+			,xla.xla_distribution_links               xdl
+			,rcv_transactions                         rt
+			,xla.xla_transaction_entities             xlte
+			,po_headers_all                           pha
+			,po_distributions_all					 pda
+		where  1=1
+		and    h.je_source                     = 'Cost Management'
+		and    h.je_category                   = 'Receiving'
+		and    h.je_header_id                  = gjl.je_header_id
+		and    h.je_header_id                  = gir.je_header_id
+		and    h.je_batch_id                   = gir.je_batch_id
+		and    gjl.je_line_num                   = gir.je_line_num
+		and    gir.gl_sl_link_id                 = xal.gl_sl_link_id
+		and    gir.gl_sl_link_table              = xal.gl_sl_link_table
+		and    xah.ae_header_id                  = xal.ae_header_id
+		and    xah.event_id                      = xle.event_id
+		and    xle.event_id                      = xdl.event_id
+		and    xah.ae_header_id                  = xdl.ae_header_id
+		and    xal.ae_line_num                   = xdl.ae_line_num
+		and    xle.entity_id                     = xlte.entity_id
+		and    xlte.transaction_number           = rt.TRANSACTION_ID
+		and    pha.po_header_id                  = rt.PO_HEADER_ID
+		and	   pda.po_distribution_id			 = rt.PO_DISTRIBUTION_ID
+		and    xah.application_id                = 707
+		and    xal.application_id                = 707
+		and    xle.application_id                = 707
+		and    xdl.application_id                = 707
+		and    xlte.application_id               = 707
+		and	   gjl.PERIOD_NAME = '$(vperiod)';
+		
+		//Invoice lookup
+		INV_map:
+		Mapping
+		LOAD *;
+		SQL select gjh.PERIOD_NAME || '|' || gjl.je_header_id || gjl.je_line_num as KEY
+			,aia.INVOICE_ID
+		from gl_je_headers                gjh,
+			gl_je_lines                  gjl,
+			gl_import_references         gir,
+			xla.xla_ae_headers           xah,
+			xla.xla_ae_lines             xal,
+			xla.xla_events               xle,
+			xla.xla_transaction_entities xlte,
+			ap_invoices_all              aia
+		where 1 = 1
+		and gjh.je_source			= 'Payables'
+		and gjh.je_category			= 'Purchase Invoices'
+		and gjh.je_header_id			= gjl.je_header_id
+		and gjh.je_header_id			= gir.je_header_id
+		and gjh.je_batch_id			= gir.je_batch_id
+		and gjl.je_line_num			= gir.je_line_num
+		and gir.gl_sl_link_id		= xal.gl_sl_link_id
+		and gir.gl_sl_link_table 	= xal.gl_sl_link_table
+		and xah.ae_header_id			= xal.ae_header_id
+		and xah.event_id				= xle.event_id
+		and xle.entity_id			= xlte.entity_id
+		and xle.application_id		= xlte.application_id
+		and xlte.transaction_number	= aia.invoice_num
+		and xlte.source_id_int_1		= aia.invoice_id
+		and xah.application_id		= 200
+		and xal.application_id		= 200
+		and xle.application_id		= 200
+		and xlte.application_id		= 200
+		and gjl.PERIOD_NAME = '$(vperiod)';
+		
+		// Project lookup
+		PROJ_map:
+		Mapping
+		LOAD *;
+		SQL select gjh.PERIOD_NAME || '|' || gjl.je_header_id || gjl.je_line_num as KEY,
+			pdr.PROJECT_ID
+		from gl_je_headers                gjh,
+			gl_je_lines                  gjl,
+			gl_import_references         gir,
+			xla.xla_ae_headers           xah,
+			xla.xla_ae_lines             xal,
+			xla.xla_events               xle,
+			xla.xla_distribution_links   xdl,
+			xla.xla_transaction_entities xlte,
+			pa_draft_revenues_all        pdr
+		where 1 = 1
+		and gjh.je_source = 'Project Accounting'
+		and gjh.je_category = 'Revenue'
+		and gjh.je_header_id = gjl.je_header_id
+		and gjh.je_header_id = gir.je_header_id
+		and gjh.je_batch_id = gir.je_batch_id
+		and gjl.je_line_num = gir.je_line_num
+		and gir.gl_sl_link_id = xal.gl_sl_link_id
+		and gir.gl_sl_link_table = xal.gl_sl_link_table
+		and xah.ae_header_id = xal.ae_header_id
+		and xah.event_id = xle.event_id
+		and xle.event_id = xdl.event_id
+		and xah.ae_header_id = xdl.ae_header_id
+		and xal.ae_line_num = xdl.ae_line_num
+		and xle.entity_id = xlte.entity_id
+		and pdr.event_id = gjl.reference_6
+		and xah.application_id		= 275
+		and xal.application_id		= 275
+		and xle.application_id		= 275
+		and xlte.application_id		= 275
+		and gjl.PERIOD_NAME = '$(vperiod)';
+		
+
+		// Lease lookup
+		LEASE_map:
+		Mapping LOAD 
+		KEY, 
+     		LEASE_ID
+		FROM $(QVDPathRaw)\LEASE_map_raw.QVD (qvd);
+
+
+		// Receivables lookup
+		RECV_map:
+		Mapping
+		LOAD *;
+		SQL 
+		select gjh.PERIOD_NAME || '|' || gjl.je_header_id || gjl.je_line_num as KEY,
+			rxta.customer_trx_id
+		from gl_je_headers                gjh,
+		gl_je_lines                  gjl,
+		gl_import_references         gir,
+		xla.xla_ae_headers           xah,
+		xla.xla_ae_lines             xal,
+		xla.xla_events               xle,
+		xla.xla_transaction_entities xlte,
+		ra_customer_trx_all          rxta,
+		ra_batches_all               rba
+		where 1 = 1
+		and gjh.je_source = 'Receivables'
+		and gjh.je_header_id = gjl.je_header_id
+		and gjh.je_header_id = gir.je_header_id
+		and gjh.je_batch_id = gir.je_batch_id
+		and gjl.je_line_num = gir.je_line_num
+		and gir.gl_sl_link_id = xal.gl_sl_link_id
+		and gir.gl_sl_link_table = xal.gl_sl_link_table
+		and xah.ae_header_id = xal.ae_header_id
+		and xah.event_id = xle.event_id
+		and xle.entity_id = xlte.entity_id
+		and xle.application_id = xlte.application_id
+		and xlte.transaction_number = rxta.trx_number
+		and rxta.batch_id = rba.batch_id
+		and xah.application_id = 222
+		and xal.application_id = 222
+		and xle.application_id = 222
+		and xlte.application_id = 222
+		and gjl.PERIOD_NAME = '$(vperiod)' ;
+		
+		//Check to see if QVD already exists
+		if len(QvdCreateTime('$(QVDPathRaw)\GL_JE_LINES_raw_$(vperiod).qvd'))>0 and vRuntype = 'Normal' then
+		
+			//if so then load data from GL Journals that has been changed since last load
+			[JNL_$(vperiod)]:
+			LOAD *,
+			ApplyMap('PD_map',PERIOD_NAME&'|'&PK,'') as %_PO_DISTRIBUTION_ID,
+			ApplyMap('INV_map',PERIOD_NAME&'|'&PK,'') as %_AP_INVOICE_ID,
+			ApplyMap('PROJ_map',PERIOD_NAME&'|'&PK,'') as %_EBS_Project_ID,
+			ApplyMap('LEASE_map',PERIOD_NAME&'|'&PK,'') as %_LEASE_ID,
+			ApplyMap('RECV_map',PERIOD_NAME&'|'&PK,'') as %_CUSTOMER_TRX_ID;
+			SQL Select GL_JE_LINES.*,JE_HEADER_ID ||JE_LINE_NUM as PK from GL_JE_LINES where LAST_UPDATE_DATE >= TO_DATE('$(vLastruntime)','dd/mm/yyyy hh24:mi:ss') and PERIOD_NAME = '$(vperiod)' 
+			//and GL_JE_LINES.EFFECTIVE_DATE >= TO_DATE('2010-07-01 00:00:00', 'yyyy-MM-dd hh24:mi:ss')
+			;
+			//and concatenate the existing data from QVD where it doesn't exist in the load above
+			Concatenate ([JNL_$(vperiod)])
+			LOAD *
+			FROM $(QVDPathRaw)\GL_JE_LINES_raw_$(vperiod).qvd (QVD) where not Exists(PK);
+			
+		//if no QVD existing then....
+		else 
+			
+			// Load all the data from GL Journals for that period
+			[JNL_$(vperiod)]:
+			LOAD *,
+			ApplyMap('PD_map',PERIOD_NAME&'|'&PK,'') as %_PO_DISTRIBUTION_ID,
+			ApplyMap('INV_map',PERIOD_NAME&'|'&PK,'') as %_AP_INVOICE_ID,
+			ApplyMap('PROJ_map',PERIOD_NAME&'|'&PK,'') as %_EBS_Project_ID,
+			ApplyMap('LEASE_map',PERIOD_NAME&'|'&PK,'') as %_LEASE_ID,
+			ApplyMap('RECV_map',PERIOD_NAME&'|'&PK,'') as %_CUSTOMER_TRX_ID;
+			SQL Select GL_JE_LINES.*, JE_HEADER_ID ||JE_LINE_NUM as PK from GL_JE_LINES where  PERIOD_NAME = '$(vperiod)' 
+			//and GL_JE_LINES.EFFECTIVE_DATE >= TO_DATE('2010-07-01 00:00:00', 'yyyy-MM-dd hh24:mi:ss')
+			;
+		
+		endif;
+		
+	//	[GL_$(vperiod)]:
+	//		LOAD *;
+	//		SQL Select GL_JE_LINES.*, JE_HEADER_ID ||JE_LINE_NUM as PK from GL_JE_LINES where  PERIOD_NAME = '$(vperiod)' 
+	//		//and GL_JE_LINES.EFFECTIVE_DATE >= TO_DATE('2010-07-01 00:00:00', 'yyyy-MM-dd hh24:mi:ss')
+	//		;
+		
+		//Save the QVD!
+		STORE [JNL_$(vperiod)] into $(QVDPathRaw)\GL_JE_LINES\GL_JE_LINES_raw_$(vperiod).qvd (QVD);
+		
+		//Drop the tables that have been stored
+		DROP Table [JNL_$(vperiod)];
+		
+		// increment the load and move onto the next period
+	
+	next i
+	//exit script;
+	
+	drop table dist_period;
+
+ENDIF;
+
+//exit script;
+
+
+
+///$tab GL BALANCES
+////////////////////////////////////////////////////////////////////////////////
+//
+// Load individual period QVDs for the GL Balances tables - only loads data and 
+// periods which have been edited since last loader run.ce last loader run.
+//
+////////////////////////////////////////////////////////////////////////////////
+
+//If 'normal', incremental load a table of all the distinct periods that have been edited since the loader was last run
+
+If vRuntype = 'Normal' then
+
+	dist_period:
+	LOAD PERIOD_NAME as P_NAME; 
+	SQL 
+	Select distinct PERIOD_NAME 
+	from GL_BALANCES 
+	where  to_date('01-' || replace(PERIOD_NAME, 'ADJ', 'JUN'),'DD-MON-YY') >= to_Date('01-JUL-15','DD-MON-YY') 
+	and template_id is null 
+	and LAST_UPDATE_DATE >= TO_DATE('$(vLastruntime)','dd/mm/yyyy hh24:mi:ss');
+
+ELSE
+
+	dist_period:
+	LOAD BAL_Fiscal_Period as P_NAME
+	FROM
+	[$(RefDataPath)\GL Periods.xlsx]
+	(ooxml, embedded labels, table is [Balances])
+	WHERE(not IsNull(BAL_Fiscal_Period));
+
+ENDIF;
+
+If NoOfRows('dist_period') > 0 then
+
+	// loop through the periods 
+	for i = 0 to NoOfRows('dist_period')-1
+	
+		//Set a parameter for the first period in the periods table
+		let vperiod = peek('P_NAME',$(i),'dist_period');
+		
+		TRACE $(vperiod);
+		
+		//Check to see if QVD already exists
+		if len(QvdCreateTime('$(QVDPathRaw)\GL_BALANCES_raw_$(vperiod).qvd'))>0 and vRuntype = 'Normal' then
+		
+			//if so then load data from GL Journals that has been changed since last load
+			[GL_$(vperiod)]:
+			LOAD *;
+			SQL Select GL_BALANCES.*, LEDGER_ID || CODE_COMBINATION_ID || PERIOD_NAME || ACTUAL_FLAG || CURRENCY_CODE || BUDGET_VERSION_ID as PK from GL_BALANCES where LAST_UPDATE_DATE >= TO_DATE('$(vLastruntime)','dd/mm/yyyy hh24:mi:ss') and PERIOD_NAME = '$(vperiod)';
+			//and concatenate the existing data from QVD where it doesn't exist in the load above
+			Concatenate ([GL_$(vperiod)])
+			LOAD *
+			FROM $(QVDPathRaw)\GL_BALANCES_raw_$(vperiod).qvd (QVD) where not Exists(PK);
+		
+			
+		//if no QVD existing then....
+		else 
+		
+			// Load the data from GL Journals that has changed since last load
+			[GL_$(vperiod)]:
+			LOAD *;
+			SQL Select GL_BALANCES.*,LEDGER_ID || CODE_COMBINATION_ID || PERIOD_NAME || ACTUAL_FLAG || CURRENCY_CODE || BUDGET_VERSION_ID as PK from GL_BALANCES where  PERIOD_NAME = '$(vperiod)';
+		
+		endif;
+		
+	//	[GL_$(vperiod)]:
+	//		LOAD *;
+	//		SQL Select GL_BALANCES.*,LEDGER_ID || CODE_COMBINATION_ID || PERIOD_NAME || ACTUAL_FLAG || CURRENCY_CODE || BUDGET_VERSION_ID as PK from GL_BALANCES where  PERIOD_NAME = '$(vperiod)';
+	//	
+		
+		//Save the QVD!
+		STORE [GL_$(vperiod)] into $(QVDPathRaw)\GL_BALANCES\GL_BALANCES_raw_$(vperiod).qvd (QVD);
+		
+		//Drop the tables that have been stored
+		DROP Table [GL_$(vperiod)];
+		
+		
+		// increment the load and move onto the next period
+	
+	next i
+	
+	drop table dist_period;
+
+ENDIF;
+
+
+///$tab GL_JE_BATCHES
+////////////////////////////////////////////////////////////////////////////////
+//
+// Load individual journal batches QVDs for the GL_JE_BATCHES tables 
+// only loads data and periods which have been edited since last loader run.
+//
+////////////////////////////////////////////////////////////////////////////////
+
+//Set Last Loaded Date from Current QVD (if available)	
+LET vLastLoadedDate = if(isnull(QvdCreateTime('$(QVDPathRaw)\GL_JE_BATCHES_raw.qvd')) or QvdNoOfRecords('$(QVDPathRaw)\GL_JE_BATCHES_raw.qvd')=0, date('01/01/2001', 'DD-MMM-YY'), date(QvdCreateTime('$(QVDPathRaw)\GL_JE_BATCHES_raw.qvd'), 'DD-MMM-YY'));
+//
+//TRACE $(vLastLoadedDate);
+
+//Load from Database where last update date is greater than or equal to last QVD load date. 
+QUALIFY [*];
+UNQUALIFY [%_PRIMARY_KEY];
+
+GL_JE_BATCHES:
+LOAD JE_BATCH_ID as [%_PRIMARY_KEY], *;
+SQL SELECT *
+FROM GL_JE_BATCHES
+Where LAST_UPDATE_DATE >= TO_DATE('$(vLastLoadedDate)','DD-Mon-YY');
+
+UNQUALIFY [*];
+
+//Check if there was a QVD of not. If there was then concatenate data from QVD excluding those rows with the same PK as that loaded from Database. 
+IF not isnull(QvdCreateTime('$(QVDPathRaw)\GL_JE_BATCHES_raw.QVD')) then 
+
+	Concatenate (GL_JE_BATCHES)
+	LOAD *
+	FROM $(QVDPathRaw)\GL_JE_BATCHES_raw.QVD (QVD)
+	WHERE not exists (%_PRIMARY_KEY);
+
+end if;
+
+Store GL_JE_BATCHES into  $(QVDPathRaw)\GL_JE_BATCHES_raw.QVD (QVD);
+
+Drop table GL_JE_BATCHES;
+
+///$tab GL_JE_HEADERS
+////////////////////////////////////////////////////////////////////////////////
+//
+// Load individual journal header QVDs for the GL_JE_HEADERS tables 
+// only loads data and periods which have been edited since last loader run.
+//
+////////////////////////////////////////////////////////////////////////////////
+
+//Set Last Loaded Date from Current QVD (if available)	
+LET vLastLoadedDate = if(isnull(QvdCreateTime('$(QVDPathRaw)\GL_JE_HEADERS_raw.qvd')) or QvdNoOfRecords('$(QVDPathRaw)\GL_JE_HEADERS_raw.qvd')=0, date('01/01/2001', 'DD-MMM-YY'), date(QvdCreateTime('$(QVDPathRaw)\GL_JE_HEADERS_raw.qvd'), 'DD-MMM-YY'));
+//
+//TRACE $(vLastLoadedDate);
+
+//Load from Database where last update date is greater than or equal to last QVD load date. 
+QUALIFY [*];
+UNQUALIFY [%_PRIMARY_KEY];
+
+GL_JE_HEADERS:
+LOAD JE_HEADER_ID as [%_PRIMARY_KEY], *;
+SQL SELECT *
+FROM GL_JE_HEADERS
+Where LAST_UPDATE_DATE >= TO_DATE('$(vLastLoadedDate)','DD-Mon-YY');
+
+UNQUALIFY [*];
+
+//Check if there was a QVD of not. If there was then concatenate data from QVD excluding those rows with the same PK as that loaded from Database. 
+IF not isnull(QvdCreateTime('$(QVDPathRaw)\GL_JE_HEADERS_raw.QVD')) then 
+
+	Concatenate (GL_JE_HEADERS)
+	LOAD *
+	FROM $(QVDPathRaw)\GL_JE_HEADERS_raw.QVD (QVD)
+	WHERE not exists (%_PRIMARY_KEY);
+
+end if;
+
+Store GL_JE_HEADERS into  $(QVDPathRaw)\GL_JE_HEADERS_raw.QVD (QVD);
+
+Drop table GL_JE_HEADERS;
+
+///$tab Tidy up
+////////////////////////////////////////////////////////////////////////////////
+//
+// If 'normal', store Last runtime in QVD 
+//
+////////////////////////////////////////////////////////////////////////////////
+
+If vRuntype = 'Normal' then
+	
+	drop table Loadstart;
+
+ENDIF;
+
+STORE [Runtime] into $(QVDPathRaw)\Last_GL_Runtime.qvd (QVD);
+
+drop tables Runtime;
+//drop tables Runtime, RunTable;
+
+TRACE === Reload Complete ===;
+
+
+///$tab ScriptInfo
+////////////////////////////////////////////////////////////////////////////////
+//
+// Loads the script metadata and timings into the Script Info table.
+// A qvw loader running multiple scripts will have multiple rows in the script info table.
+//
+////////////////////////////////////////////////////////////////////////////////
+
+LET vReloadEnd = NOW(1);
+
+ScriptInfo:
+Load
+	'$(vScriptTitle)'			as [%_Script],
+	'$(vScriptTitle)'			as [Script Title],
+	'$(vScriptDescription)'		as [Script Description],
+	'$(vScriptCurrVersion)'		as [Script Current Version],
+	'$(vScriptCurrAuthor)'		as [Script Current Author],
+	'$(vReloadStart)'			as [Script Reload Start],
+	'$(vReloadEnd)'				as [Script Reload End]
+AutoGenerate 1;
+
+TRACE;
+TRACE '=== $(vScriptTitle) Reload End at $(vReloadEnd) ===';
